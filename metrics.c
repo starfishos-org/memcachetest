@@ -37,10 +37,11 @@
 #include "metrics.h"
 #include "memcachetest.h"
 
-bool initialize_thread_ctx(struct thread_context *ctx, int offset, size_t total)
+bool initialize_thread_ctx(struct thread_context *ctx, int offset, size_t total, int cpu_id)
 {
     ctx->offset = offset;
     ctx->total = total;
+    ctx->cpu_id = cpu_id;
 
     for (int ii = 0; ii < TX_CAS - TX_GET; ++ii) {
         ctx->tx[ii].set = calloc(ctx->total, sizeof(hrtime_t));
@@ -99,10 +100,12 @@ struct ResultMetrics *calc_metrics(enum TxnType tx_type,
     qsort(sample->set, sample->current, sizeof(hrtime_t), compare);
 
     ret->success_count = sample->current ;
+    long percentile50 = (0.5) * (float) (ret->success_count - 1) + 1.0;
     long percentile90 = (0.9) * (float) (ret->success_count - 1) + 1.0;
     long percentile95 = (0.95) * (float) (ret->success_count - 1) + 1.0;
     long percentile99 = (0.99) * (float) (ret->success_count - 1) + 1.0;
 
+    ret->max50th_result = sample->set[percentile50];
     ret->max90th_result = sample->set[percentile90];
     ret->max95th_result = sample->set[percentile95];
     ret->max99th_result = sample->set[percentile99];
@@ -130,7 +133,8 @@ static const char* hrtime2text(hrtime_t t, char *buffer, size_t size) {
     static const char * const extensions[] = {"s", "ms", "us", "ns"}; //TODO: get a greek Mu in here correctly
     int id = sizeof(extensions)/sizeof(extensions[0]) - 1;
 
-    while (t > 9999 && id > 0) {
+    // while (t > 9999 && id > 0) {
+    while (t > 9999 && id > 2) { // only convert to us
         id--;
         t /= 1000;
     }
@@ -153,14 +157,16 @@ static void print_details(enum TxnType tx_type, struct ResultMetrics *r) {
     char tavg[80];
     char tmin[80];
     char tmax[80];
+    char tmax50[80];
     char tmax90[80];
     char tmax95[80];
     char tmax99[80];
-    printf("     #of ops.       min       max       avg   max90th   max95th   max99th\n");
-    printf("%13ld%10.10s%10.10s%10.10s%10.10s%10.10s%10.10s\n\n", r->success_count,
+    printf("     #of ops.       min       max       avg    medium   max90th   max95th   max99th\n");
+    printf("%13ld%10.10s%10.10s%10.10s%10.10s%10.10s%10.10s%10.10s\n\n", r->success_count,
            hrtime2text(r->min_result, tmin, sizeof (tmin)),
            hrtime2text(r->max_result, tmax, sizeof (tmax)),
            hrtime2text(r->average, tavg, sizeof(tavg)),
+           hrtime2text(r->max50th_result, tmax50, sizeof(tmax50)),
            hrtime2text(r->max90th_result, tmax90, sizeof(tmax90)),
            hrtime2text(r->max95th_result, tmax95, sizeof(tmax95)),
            hrtime2text(r->max99th_result, tmax99, sizeof(tmax99)));
@@ -187,7 +193,7 @@ void print_aggregated_metrics(struct thread_context *ctx, int num)
 
     struct thread_context context;
     memset(&context, 0, sizeof(context));
-    initialize_thread_ctx(&context, 0, total);
+    initialize_thread_ctx(&context, 0, total, 0);
 
     for (int ii = 0; ii < num; ++ii) {
         for (int jj = 0; jj < TX_CAS - TX_GET; ++jj) {

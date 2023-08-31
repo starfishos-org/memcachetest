@@ -45,6 +45,7 @@ void print_aggregated_metrics(struct thread_context *, int);
 struct ResultMetrics {
     hrtime_t max_result;
     hrtime_t min_result;
+    hrtime_t max50th_result;
     hrtime_t max90th_result;
     hrtime_t max95th_result;
     hrtime_t max99th_result;

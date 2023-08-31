@@ -132,7 +132,7 @@ int libmemc_add_server(struct Memcache *handle, const char *host, in_port_t port
 
     struct Server *server = server_create(host, port);
     if (server != NULL) {
-        handle->servers[handle->no_servers++] = server;
+	    handle->servers[handle->no_servers++] = server;
     }
 
     return 0;
@@ -211,6 +211,7 @@ int libmemc_connect_server(const char *hostname, in_port_t port)
     if (ai != NULL) {
         if ((sock = socket(ai->ai_family, ai->ai_socktype,
                            ai->ai_protocol)) != -1) {
+            printf("[libmemc_connect_server] socket success\n");
             if (connect(sock, ai->ai_addr, ai->ai_addrlen) == -1) {
                 fprintf(stderr, "Failed to connect socket: %s\n",
                         strerror(errno));
@@ -459,8 +460,10 @@ static int server_sendv(struct Server* server, struct iovec *iov, int iovcnt) {
 static size_t server_receive(struct Server* server, char* data, size_t size, int line) {
     size_t offset = 0;
     int stop = 0;
+    // printf("enter %s\n", __func__);
     do {
         ssize_t nread = recv(server->sock, data + offset, size - offset, 0);
+        // printf("%s: recv nread=%d\n", __func__, nread);
         if (nread == -1) {
             if (errno != EINTR) {
                 char errmsg[1024];
@@ -781,18 +784,24 @@ static int textual_get(struct Server* server, struct Item* item) {
     iovec[2].iov_base = (char*)"\r\n";
     iovec[2].iov_len = 2;
     server_sendv(server, iovec, 3);
+	// struct timeval start, end;
+	// gettimeofday(&start, NULL );
 
     size_t nread = server_receive(server, server->buffer,server->buffersize, 1);
-
+	// gettimeofday(&end, NULL );
+	// printf("server_receive time=%llu\n",
+	//        end.tv_sec * 1000000 + end.tv_usec -
+	// 	   (start.tv_sec * 1000000 + start.tv_usec));
     if (nread == 0) {
-        return -2;
+	    return -2;
     }
 
     // Split the header line
+    // gettimeofday(&start, NULL );
     if (strstr(server->buffer, "VALUE ") == server->buffer) {
         size_t elemsize;
         char *ptr;
-
+        // printf("VALUE\n");
         if (parse_value_line(server->buffer + 6, &flag, &elemsize, &ptr) == -1){
             server->errmsg = strdup("Protocol error");
             server_disconnect(server);
@@ -802,9 +811,12 @@ static int textual_get(struct Server* server, struct Item* item) {
         size_t chunk = nread - headsize;
 
         if (chunk < (elemsize + 7)) {
+            // printf("I don't have all of the data.. chunk=%llu, nread=%llu, elemsize=%llu\n", chunk, nread, elemsize);
             // I don't have all of the data.. keep on reading
             server_receive(server, server->buffer + nread,
                            (elemsize - chunk) + 7, 0);
+        } else {
+            // printf("I have all of the data.. chunk=%llu, nread=%llu, elemsize=%llu\n", chunk, nread, elemsize);
         }
 
         void *result = ptr;
@@ -828,7 +840,13 @@ static int textual_get(struct Server* server, struct Item* item) {
         textual_seterrmsg(server, strdup("ASCII get error: "));
         return -2; //indicating a server error
     }
-
+//  gettimeofday(&end, NULL );
+// 	printf("Split the header line time=%llu\n",
+// 	       end.tv_sec * 1000000 + end.tv_usec -
+// 		   (start.tv_sec * 1000000 + start.tv_usec));
+    if (nread == 0) {
+        return -2;
+    }
     abort();
 }
 

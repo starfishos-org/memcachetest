@@ -60,6 +60,8 @@
 #include "boxmuller.h"
 #include "vbucket.h"
 
+#define PLAT_CPU_NUM 16
+
 #ifndef MAXINT
 /* MAXINT doesn't seem to exist on MacOS */
 #define MAXINT (int)(unsigned int)-1
@@ -119,8 +121,11 @@ long long no_iterations = 10000;
 /** If we should verify the data received. May be overridden with -V */
 int verify_data = 0;
 
-/** The probaility for a set operation */
+/** The probability for a set operation */
 int setprc = 33;
+
+/** Whether item bodies are random-looking, which affects compressibility */
+int random_value = 1;
 
 int verbose = 0;
 
@@ -157,6 +162,11 @@ int current_memcached_library = LIBMEMC_TEXTUAL;
  * Print progress information during the test..
  */
 static int progress = 0;
+static long gets_count = 0;
+static long sets_count = 0;
+static long start_time = 0;
+static long runtime_limit = 0;
+
 
 struct connection {
     pthread_mutex_t mutex;
@@ -253,7 +263,7 @@ static void *create_memcached_handle(void) {
             sprintf(rest_server, "%s:%d", hosts->hostname, hosts->port);
             libcouchbase_t instance = libcouchbase_create(rest_server,
                                                           NULL, NULL, NULL,
-                                                          evbase);
+                                                          NULL);
             if (instance == NULL) {
                 fprintf(stderr, "Failed to create libcouchbase instance\n");
                 event_base_free(evbase);
@@ -266,6 +276,7 @@ static void *create_memcached_handle(void) {
                 exit(1);
             }
 
+            libcouchbase_wait(instance);
             (void)libcouchbase_set_storage_callback(instance, storage_callback);
             (void)libcouchbase_set_get_callback(instance, get_callback);
 
@@ -350,6 +361,7 @@ static void release_memcached_handle(void *handle) {
 static inline int memcached_set_wrapper(struct connection *connection,
                                         const char *key, int nkey,
                                         const void *data, int size) {
+
     struct memcachelib* lib = (struct memcachelib*)connection->handle;
     switch (lib->type) {
 #ifdef HAVE_LIBMEMCACHED
@@ -373,7 +385,7 @@ static inline int memcached_set_wrapper(struct connection *connection,
             e = libcouchbase_store(instance, &cb, LIBCOUCHBASE_SET, key,
                                    nkey, data, size, 0, 0, 0);
             assert(e == LIBCOUCHBASE_SUCCESS);
-            libcouchbase_execute(instance);
+            libcouchbase_wait(instance);
             if (cb.error != LIBCOUCHBASE_SUCCESS) {
                 return -1;
             }
@@ -400,6 +412,7 @@ static inline int memcached_set_wrapper(struct connection *connection,
     default:
         abort();
     }
+    sets_count++;
     return 0;
 }
 
@@ -445,7 +458,7 @@ static inline bool memcached_get_wrapper(struct connection* connection,
             e = libcouchbase_mget(instance, &cb, 1,
                                   (const void * const *)keys, nkeys, NULL);
             assert(e == LIBCOUCHBASE_SUCCESS);
-            libcouchbase_execute(instance);
+            libcouchbase_wait(instance);
             if (cb.error != LIBCOUCHBASE_SUCCESS) {
                 return false;
             }
@@ -475,6 +488,7 @@ static inline bool memcached_get_wrapper(struct connection* connection,
         abort();
     }
 
+    gets_count++;
     return true;
 }
 
@@ -561,7 +575,16 @@ static int initialize_dataset(void) {
         return -1;
     }
 
-    memset(datablock.data, 0xff, datablock.size);
+    if (random_value > 0) {
+        for (size_t i = 0, x = 332211; i < datablock.size; i++) {
+            char c = (char) x & 0x007f;
+            c = c > ' ' ? c : c + ' ' + 1;
+            ((char *) datablock.data)[i] = c;
+            x = (x + (i ^ x)) >> (x % 5);
+        }
+    } else {
+        memset(datablock.data, 0xff, datablock.size);
+    }
 
     if (dataset != NULL) {
         free(dataset);
@@ -601,7 +624,9 @@ static int populate_dataset(struct thread_context *ctx) {
     size_t nkey;
     int sres = -1;
 
-    assert(end > ctx->offset);
+    if (end > ctx->offset)
+	    ctx->offset = 0;
+
     if (verbose) {
         fprintf(stderr, "Populating from %d to %d\n", ctx->offset, end);
     }
@@ -658,7 +683,7 @@ static int populate_data(int no_threads) {
     for (ii = 0; ii < no_threads; ++ii) {
         struct thread_context *ctxi = &ctx[ii];
         if (!initialize_thread_ctx(ctxi, offset,
-                                   (rest > 0) ? perThread + 1 : perThread)) {
+                                   (rest > 0) ? perThread + 1 : perThread, 0)) {
             abort();
         }
         offset += perThread;
@@ -699,51 +724,56 @@ static int test(struct thread_context *ctx) {
     struct connection* connection;
     char key[256];
     size_t nkey;
+
     for (size_t ii = 0; ii < ctx->total; ++ii) {
-        connection = get_connection();
-        int idx = get_setval();
-        nkey = snprintf(key, sizeof(key), "%s%d", prefix, idx);
+	    connection = get_connection();
+	    int idx = get_setval();
+	    nkey = snprintf(key, sizeof(key), "%s%d", prefix, idx);
 
-        if (setprc > 0 && (random() % 100) < setprc) {
-            if (verbose) {
-                fprintf(stderr, "CMD: set %s\n", key);
-            }
-            hrtime_t delta;
-            hrtime_t start = gethrtime();
-            memcached_set_wrapper(connection, key, nkey,
-                                  datablock.data, dataset[idx]);
-            delta = gethrtime() - start;
-            record_tx(TX_SET, delta, ctx);
-        } else {
-            /* go set it from random data */
-            if (verbose) {
-                fprintf(stderr, "CMD: get %s\n", key);
-            }
-            hrtime_t delta;
-            size_t size = 0;
-            hrtime_t start = gethrtime();
-            void *data;
-            bool found = memcached_get_wrapper(connection, key, nkey, &size,
-                                               &data);
+	    if (setprc > 0 && (random() % 100) < setprc) {
+		    if (verbose) {
+			    fprintf(stderr, "CMD: set %s\n", key);
+		    }
+		    hrtime_t delta;
+		    hrtime_t start = gethrtime();
+		    memcached_set_wrapper(connection, key, nkey, datablock.data,
+					  dataset[idx]);
+            // if (ii % 10 == 0)
+            //     printf("... [%d/%d]\n", ii, ctx->total);
+		    delta = gethrtime() - start;
+		    record_tx(TX_SET, delta, ctx);
+	    } else {
+		    /* go set it from random data */
+		    if (verbose) {
+			    fprintf(stderr, "CMD: get %s\n", key);
+		    }
+		    hrtime_t delta;
+		    size_t size = 0;
+		    hrtime_t start = gethrtime();
+		    void *data;
+		    bool found = memcached_get_wrapper(connection, key, nkey,
+						       &size, &data);
 
-            delta = gethrtime() - start;
-            if (found) {
-                if (size != dataset[idx]) {
-                    fprintf(stderr,
-                            "Incorrect length returned for <%s>. "
-                            "Stored %zu got %zu\n",
-                            key, dataset[idx], (long)size);
-                } else if (verify_data &&
-                           memcmp(datablock.data, data, size) != 0) {
-                    fprintf(stderr, "Garbled data for <%s>\n", key);
-                }
-                record_tx(TX_GET, delta, ctx);
-                free(data);
-            } else {
-                fprintf(stderr, "<%s> isn't there anymore\n", key);
-            }
-        }
-        release_connection(connection);
+		    delta = gethrtime() - start;
+		    if (found) {
+			    if (size != dataset[idx]) {
+				    fprintf(
+					stderr,
+					"Incorrect length returned for <%s>. "
+					"Stored %zu got %zu\n",
+					key, dataset[idx], (long)size);
+			    } else if (verify_data && memcmp(datablock.data,
+							     data, size) != 0) {
+				    fprintf(stderr, "Garbled data for <%s>\n",
+					    key);
+			    }
+			    record_tx(TX_GET, delta, ctx);
+			    free(data);
+		    } else {
+			    // fprintf(stderr, "<%s> isn't there anymore\n", key);
+		    }
+	    }
+	    release_connection(connection);
     }
 
     return ret;
@@ -756,6 +786,9 @@ static int test(struct thread_context *ctx) {
  * @return arg
  */
 static void *test_thread_main(void* arg) {
+    /* Set self affinity */
+    usys_set_affinity(-1,((struct thread_context*)arg)->cpu_id);
+    sched_yield();
     test((struct thread_context*)arg);
     return arg;
 }
@@ -797,6 +830,7 @@ static struct addrinfo *lookuphost(const char *hostname, in_port_t port) {
     (void)snprintf(service, NI_MAXSERV, "%d", port);
     if ((error = getaddrinfo(hostname, service, &hints, &ai)) != 0) {
         if (error != EAI_SYSTEM) {
+            fprintf(stderr, "hostname=%s", hostname);
             fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(error));
         } else {
             perror("getaddrinfo()");
@@ -823,6 +857,7 @@ static int get_server_rusage(const struct host *entry, struct rusage *rusage) {
             if ((sock = socket(addrinfo->ai_family,
                                addrinfo->ai_socktype,
                                addrinfo->ai_protocol)) != -1) {
+                // printf("get_server_rusage socket success\n");
                 if (connect(sock, addrinfo->ai_addr, addrinfo->ai_addrlen) != -1) {
                     if (send(sock, "stats\r\n", 7, 0) > 0) {
                         if (recv(sock, buffer, sizeof(buffer), 0) > 0) {
@@ -869,6 +904,19 @@ static int get_server_rusage(const struct host *entry, struct rusage *rusage) {
     return ret;
 }
 
+static void exit_handler(int signum)
+{
+    long end_time = (int)time(NULL);
+    long time_taken = end_time - start_time;
+    long ops_sec = ((float)gets_count + sets_count) / time_taken;
+    printf("\n\ngets: %ld, sets: %ld, time: %ld, ops/sec: %ld\n",
+           gets_count,
+           sets_count,
+           time_taken,
+           ops_sec);
+    exit(0);
+}
+
 /**
  * Program entry point
  * @param argc argument count
@@ -886,7 +934,7 @@ int main(int argc, char **argv) {
     int size;
     gettimeofday(&starttime, NULL);
 
-    while ((cmd = getopt(argc, argv, "K:QW:M:pL:P:Fm:t:h:i:s:c:VlSvC:")) != EOF) {
+    while ((cmd = getopt(argc, argv, "K:QW:M:pL:P:Fm:t:T:h:i:s:c:VlSvC:r:")) != EOF) {
         switch (cmd) {
         case 'K':
             if (strlen(prefix) > 240) {
@@ -898,6 +946,7 @@ int main(int argc, char **argv) {
         case 'p':
             progress = 1;
             break;
+
         case 'P':
             setprc = atoi(optarg);
             if (setprc > 100) {
@@ -924,9 +973,13 @@ int main(int argc, char **argv) {
             break;
         case 'h': add_host(optarg);
             break;
+        case 'T': runtime_limit = atol(optarg);
+	        break;
         case 'i': no_items = atoi(optarg);
             break;
         case 's': srand(atoi(optarg));
+            break;
+        case 'r': random_value = atoi(optarg);
             break;
         case 'c': no_iterations = atoll(optarg);
             break;
@@ -969,6 +1022,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\t-h The hostname:port where the memcached server is running\n");
             fprintf(stderr, "\t   (use mulitple -h args for multiple servers)\n");
             fprintf(stderr, "\t-t The number of threads to use\n");
+            fprintf(stderr, "\t-T The number of seconds for which test is to be carried out\n");
+            fprintf(stderr, "\t   (used with -l loop and repeat)\n");
             fprintf(stderr, "\t-i The number of items to operate with\n");
             fprintf(stderr, "\t-c The number of iteratons each thread should do\n");
             fprintf(stderr, "\t-l Loop and repeat the test, but print out information for each run\n");
@@ -979,6 +1034,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\t-v Verbose output\n");
             fprintf(stderr, "\t-L Use the specified memcached client library\n");
             fprintf(stderr, "\t-W connection pool size\n");
+            fprintf(stderr, "\t-r Use random item values; default: 1 (true)\n");
             fprintf(stderr, "\t-s Use the specified seed to initialize the random generator\n");
             fprintf(stderr, "\t-S Skip the populate of the data\n");
             fprintf(stderr, "\t-P The probability for a set operation\n");
@@ -1002,6 +1058,7 @@ int main(int argc, char **argv) {
             maxthreads = connection_pool_size;
         }
 
+#if 0
         if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
             if (rlim.rlim_cur < (maxthreads + 10)) {
                 rlim.rlim_cur = maxthreads + 10;
@@ -1016,8 +1073,8 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Failed to get file limit: %s\n", strerror(errno));
             return 1;
         }
-    }
-
+#endif
+    }    
     if (hosts == NULL) {
         add_host("localhost");
     }
@@ -1025,11 +1082,11 @@ int main(int argc, char **argv) {
     if (initialize_dataset() == -1) {
         return 1;
     }
-
+    // printf("1: initialize_dataset\n");
     if (create_connection_pool() == -1) {
-        return 1;
+	    return 1;
     }
-
+    // printf("2: create_connection_pool\n");
     if (populate && populate_data(no_threads) != 0) {
         return 1;
     }
@@ -1037,8 +1094,17 @@ int main(int argc, char **argv) {
     if (get_server_rusage(hosts, &server_start) == -1) {
         fprintf(stderr, "Failed to get server stats\n");
     }
-
-
+    // printf("3: get_server_rusage\n");
+    if (loop)
+    {
+        signal(SIGALRM, exit_handler);
+        signal(SIGINT, exit_handler);
+        start_time = (int) time (NULL);
+        if (runtime_limit > 0)
+        {
+	        alarm(runtime_limit);
+        }
+    }
     size_t nget = 0;
     size_t nset = populate ? no_items : 0;
     do {
@@ -1053,7 +1119,7 @@ int main(int argc, char **argv) {
             for (ii = 0; ii < no_threads; ++ii) {
                 struct thread_context *ctxi = &ctx[ii];
                 if (!initialize_thread_ctx(ctxi, 0,
-                                           (rest > 0) ? perThread + 1 : perThread)) {
+                                           (rest > 0) ? perThread + 1 : perThread, (ii + 10) % PLAT_CPU_NUM)) {
                     abort();
                 }
 

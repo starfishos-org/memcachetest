@@ -47,6 +47,7 @@ extern "C" {
      * A struct for the info on the thread
      */
     struct thread_context {
+        int cpu_id;
         int offset;
         size_t total;
         struct samples tx[TX_CAS - TX_GET];
@@ -55,7 +56,8 @@ extern "C" {
 
     bool initialize_thread_ctx(struct thread_context *ctx,
                                int offset,
-                               size_t total);
+                               size_t total,
+                               int cpu_id);
 
 #ifdef	__cplusplus
 }
